@@ -46,14 +46,20 @@ class _ReplySocket:
         self.delay = 0.05
         self.requests = []
         self.handles = []
+        self.reply_release = threading.Event()
+        self.reply_release.set()
 
     async def put_async(self, request: RPCRequest) -> None:
         assert asyncio.get_running_loop() is self.client._loop
         self.requests.append(request)
         response = RPCResponse(request.request_id, result=self.records, error=self.error)
-        self.handles.append(
-            self.client._loop.call_later(self.delay, self.client._handle_regular_response, response)
-        )
+        self.handles.append(self.client._loop.call_later(self.delay, self._reply, response))
+
+    def _reply(self, response: RPCResponse) -> None:
+        if not self.reply_release.is_set():
+            self.handles.append(self.client._loop.call_later(0.001, self._reply, response))
+            return
+        self.client._handle_regular_response(response)
 
 
 @pytest.fixture
@@ -145,16 +151,20 @@ async def test_lazy_nonblocking_batch_and_timeout_forwarding(
     rpc_client, proxy_class, method, rpc_method, timeout
 ) -> None:
     client, socket = rpc_client
+    socket.reply_release.clear()
     result = getattr(_proxy(proxy_class, client), method)(timeout)
     assert isinstance(result, IterationResult)
     assert socket.requests == [], "constructing the iterator must not fetch or block"
 
     pending = asyncio.create_task(_collect(result))
     await _wait_until(lambda: bool(socket.requests))
-    # The delayed RPC remains in flight while another task on the caller's loop
+    # The gated RPC remains in flight while another task on the caller's loop
     # gets scheduled. Socket.put_async also asserts the client loop owns I/O.
-    assert not pending.done()
-    assert await asyncio.wait_for(asyncio.sleep(0, result="heartbeat"), 0.5) == "heartbeat"
+    try:
+        assert not pending.done()
+        assert await asyncio.wait_for(asyncio.sleep(0, result="heartbeat"), 0.5) == "heartbeat"
+    finally:
+        socket.reply_release.set()
     assert await asyncio.wait_for(pending, 1) == [{"iter": 1}, {"iter": 2}]
     request = socket.requests[0]
     assert request.method_name == rpc_method
@@ -240,15 +250,19 @@ async def test_cancellation_propagates_and_releases_pending_future(rpc_client) -
 @pytest.mark.asyncio
 async def test_same_iterator_concurrent_consumers_do_not_refetch(rpc_client) -> None:
     client, socket = rpc_client
+    socket.reply_release.clear()
     result = _proxy(GenerationExecutorProxy, client).aget_stats(0)
     pending = asyncio.create_task(result.__anext__())
     await _wait_until(lambda: bool(client._pending_futures))
-    with pytest.raises(RuntimeError, match="Concurrent consumption"):
-        await result.__anext__()
-    with pytest.raises(RuntimeError, match="Concurrent consumption"):
-        result.get_results()
-    with pytest.raises(RuntimeError, match="during consumption"):
-        result.mark_undone()
+    try:
+        with pytest.raises(RuntimeError, match="Concurrent consumption"):
+            await result.__anext__()
+        with pytest.raises(RuntimeError, match="Concurrent consumption"):
+            result.get_results()
+        with pytest.raises(RuntimeError, match="during consumption"):
+            result.mark_undone()
+    finally:
+        socket.reply_release.set()
     assert await pending == {"iter": 1}
     assert await _collect(result) == [{"iter": 2}]
     assert len(socket.requests) == 1
