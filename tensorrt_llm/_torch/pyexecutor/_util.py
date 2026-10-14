@@ -2645,10 +2645,9 @@ class KvCacheCreator:
         """Split enc-dec KV cache budgets between self and cross pools.
 
         The cross manager must exist for every encoder-decoder runtime. During
-        both estimation and final construction, split the same memory-derived
-        budget sources used by the legacy TRT path: the free-memory fraction,
-        any explicit ``max_gpu_total_bytes`` override, and any explicit host
-        cache budget. ``max_tokens`` is a logical cap, not a memory split knob,
+        both estimation and final construction, split the free-memory fraction,
+        any explicit ``max_gpu_total_bytes`` override, and explicit host/disk
+        cache budgets. ``max_tokens`` is a logical cap, not a memory split knob,
         so it is intentionally left unchanged. The creator's base config is not
         mutated.
         """
@@ -2689,23 +2688,25 @@ class KvCacheCreator:
             cross_kv_cache_config.max_gpu_total_bytes = cross_budget
             split_any_budget = True
 
-        host_cache_size = base_kv_cache_config.host_cache_size
-        if host_cache_size is not None and host_cache_size > 0:
-            cross_host_cache_size = int(host_cache_size * fraction)
-            self_host_cache_size = host_cache_size - cross_host_cache_size
-            logger.info(
-                f"Splitting KV cache host budget for encoder-decoder: "
-                f"total={host_cache_size / GB:.2f} GiB, "
-                f"self={self_host_cache_size / GB:.2f} GiB ({1 - fraction:.0%}), "
-                f"cross={cross_host_cache_size / GB:.2f} GiB ({fraction:.0%})")
-            self_kv_cache_config.host_cache_size = self_host_cache_size
-            cross_kv_cache_config.host_cache_size = cross_host_cache_size
-            split_any_budget = True
+        for budget_attr in self._OFFLOAD_TIER_BUDGET_ATTRS:
+            total_budget = getattr(base_kv_cache_config, budget_attr)
+            if total_budget is not None and total_budget > 0:
+                cross_budget = int(total_budget * fraction)
+                self_budget = total_budget - cross_budget
+                logger.info(
+                    f"Splitting KV cache {budget_attr} for encoder-decoder: "
+                    f"total={total_budget / GB:.2f} GiB, "
+                    f"self={self_budget / GB:.2f} GiB ({1 - fraction:.0%}), "
+                    f"cross={cross_budget / GB:.2f} GiB ({fraction:.0%})")
+                setattr(self_kv_cache_config, budget_attr, self_budget)
+                setattr(cross_kv_cache_config, budget_attr, cross_budget)
+                split_any_budget = True
 
         if not split_any_budget:
             raise ValueError("Unable to size the encoder-decoder cross KV "
                              "cache pool: neither free_gpu_memory_fraction nor "
-                             "max_gpu_total_bytes nor host_cache_size is "
+                             "max_gpu_total_bytes nor host_cache_size nor "
+                             "disk_cache_size is "
                              "available.")
 
         return self_kv_cache_config, cross_kv_cache_config

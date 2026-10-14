@@ -27,7 +27,7 @@ from transformers import PretrainedConfig
 
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
@@ -312,6 +312,59 @@ class TestSplitKvCacheBudgetForCross:
         assert self_config.host_cache_size == total_host - total_host // 4
         assert config.host_cache_size == total_host
 
+    @pytest.mark.parametrize("fraction", [0.0, 0.25, 0.4, 1.0])
+    def test_disk_cache_budget_is_split_without_mutating_base_config(self, fraction, tmp_path):
+        total_disk = 7 * (1 << 30) + 123
+        config = KvCacheConfig(
+            cross_kv_cache_fraction=fraction,
+            disk_cache_size=total_disk,
+            disk_cache_path=str(tmp_path),
+        )
+        creator = _make_creator(config, is_enc_dec=True)
+
+        self_config, cross_config = creator._split_kv_cache_budget_for_cross()
+
+        assert cross_config.disk_cache_size == int(total_disk * fraction)
+        assert self_config.disk_cache_size + cross_config.disk_cache_size == total_disk
+        assert config.disk_cache_size == total_disk
+        assert self_config.disk_cache_path == cross_config.disk_cache_path == config.disk_cache_path
+
+    @pytest.mark.parametrize("disk_cache_size", [None, 0])
+    def test_disabled_disk_cache_remains_disabled(self, disk_cache_size):
+        config = KvCacheConfig(cross_kv_cache_fraction=0.5, disk_cache_size=disk_cache_size)
+        creator = _make_creator(config, is_enc_dec=True)
+
+        self_config, cross_config = creator._split_kv_cache_budget_for_cross()
+
+        assert self_config.disk_cache_size == cross_config.disk_cache_size == disk_cache_size
+
+    def test_disk_budget_is_conserved_across_cross_and_draft_splits(self, tmp_path):
+        total_disk = 7 * (1 << 30) + 123
+        config = KvCacheConfig(
+            cross_kv_cache_fraction=0.4,
+            disk_cache_size=total_disk,
+            disk_cache_path=str(tmp_path),
+        )
+        creator = _make_creator(config, is_enc_dec=True)
+        creator._get_target_and_draft_cache_costs = Mock(
+            return_value=(CacheCost(slope=3), CacheCost(slope=1))
+        )
+
+        self_config, cross_config = creator._split_kv_cache_budget_for_cross()
+        target_config, draft_config = creator._split_kv_cache_budget_for_draft(
+            "disk_cache_size", self_config
+        )
+
+        assert draft_config is not None
+        assert draft_config.disk_cache_size == (total_disk - int(total_disk * 0.4)) // 4
+        assert (
+            target_config.disk_cache_size
+            + draft_config.disk_cache_size
+            + cross_config.disk_cache_size
+            == total_disk
+        )
+        assert config.disk_cache_size == total_disk
+
 
 # ---------------------------------------------------------------------------
 # Tests: ResourceManagerType enum
@@ -332,6 +385,32 @@ class TestResourceManagerType:
 
 class TestCrossKvCacheConstruction:
     """Exercise the Steps 4 and 5 construction path beyond helper math."""
+
+    @pytest.mark.parametrize("estimating", [False, True])
+    def test_build_managers_splits_disk_budget_between_pools(self, estimating, tmp_path):
+        total_disk = 7 * (1 << 30) + 123
+        config = KvCacheConfig(
+            cross_kv_cache_fraction=0.4,
+            disk_cache_size=total_disk,
+            disk_cache_path=str(tmp_path),
+        )
+        creator = _make_creator(config, is_enc_dec=True)
+        creator.configure_kv_cache_capacity = Mock()
+        creator._should_create_separate_draft_kv_cache = Mock(return_value=False)
+        creator._create_kv_cache_manager = Mock(return_value=Mock())
+        creator._create_cross_kv_cache_manager = Mock(return_value=Mock())
+
+        creator.build_managers({}, estimating_kv_cache=estimating)
+
+        self_config = creator._create_kv_cache_manager.call_args.kwargs["kv_cache_config_override"]
+        cross_config = creator._create_cross_kv_cache_manager.call_args.args[0]
+        if estimating:
+            assert self_config.disk_cache_size is None
+            assert cross_config.disk_cache_size is None
+        else:
+            assert cross_config.disk_cache_size == int(total_disk * 0.4)
+            assert self_config.disk_cache_size + cross_config.disk_cache_size == total_disk
+        assert config.disk_cache_size == total_disk
 
     def test_create_cross_kv_cache_manager_uses_encoder_geometry(self):
         config = _make_kv_cache_config(
