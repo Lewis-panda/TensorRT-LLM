@@ -42,6 +42,7 @@ from .postproc_worker import PostprocParams, PostprocWorkerConfig
 from .request import (DEFAULT_REQUEST_PRIORITY, GenerationRequest, LoRARequest,
                       PromptAdapterRequest)
 from .result import GenerationResult, IterationResult
+from .rpc.kv_events import _RpcKvEvents
 from .utils import IntraProcessQueue, ProcessPoolExecutorSession, RequestError
 
 if TYPE_CHECKING:
@@ -114,6 +115,7 @@ class GenerationExecutor(ABC):
 
         # whether it's the executor instance of LLM API
         self._is_llm_executor = is_llm_executor
+        self._kv_events_fetcher = _RpcKvEvents()
         self._iter_kv_events_result: IterationResult | None = None
         self._iter_stats_result: IterationResult | None = None
 

@@ -1149,6 +1149,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         # close the RPC client
         if self.rpc_client is not None:
+            self._kv_events_fetcher.close()
             self.rpc_client.close()
             self.rpc_client = None
 
@@ -1404,55 +1405,21 @@ class GenerationExecutorProxy(GenerationExecutor):
         return self._iter_stats_result
 
     def get_kv_events(self, timeout: float) -> List[dict]:
-        """Get iteration KV events from the runtime via RPC.
-
-        Args:
-            timeout (float): Max wait time in seconds for the RPC call.
-
-        Returns:
-            List[dict]: A list of runtime events as dict.
-        """
-        if self.rpc_client is None:
-            logger.warning("RPC client not initialized, cannot get kv events")
-            return []
-
-        try:
-            events = self.rpc_client.fetch_kv_cache_events_wait_async(
-                timeout=timeout).remote()
-            return [json.loads(e) if isinstance(e, str) else e for e in events]
-        except Exception as e:
-            logger.error(f"Error fetching kv events via RPC: {e}")
-            return []
+        """Get buffered KV events, reusing any outstanding asynchronous poll."""
+        return self._kv_events_fetcher.result(self.rpc_client,
+                                              timeout).get_results()
 
     def aget_kv_events(self, timeout: float) -> IterationResult:
-        """Get iteration KV events from the runtime via RPC (async).
+        """Get buffered KV events without blocking the caller's event loop.
 
-        Args:
-            timeout (float): Max wait time in seconds for the RPC call.
-
-        Returns:
-            IterationResult: An async iterable object containing runtime events.
+        Unconsumed events and an outstanding poll survive cancellation of a
+        reader. Subsequent readers drain that batch before starting a new poll;
+        joining an outstanding poll preserves its original timeout.
         """
-        # Initialize iteration result if needed
-        self._maybe_initialize_iteration_results()
-
-        if self._iter_kv_events_result is None:
+        if not self._is_llm_executor:
             from .executor import empty_async_iterable
             return empty_async_iterable()
-
-        # Fetch kv events via RPC and populate the result
-        try:
-            events = self.rpc_client.fetch_kv_cache_events_wait_async(
-                timeout=timeout).remote()
-        except Exception as e:
-            logger.debug(f"Error fetching kv events via RPC: {e}")
-            events = []
-
-        for event in events:
-            self._iter_kv_events_result.queue.put(event)
-
-        self._iter_kv_events_result.set_timeout(timeout)
-        return self._iter_kv_events_result
+        return self._kv_events_fetcher.result(self.rpc_client, timeout)
 
     def __del__(self):
         self.shutdown()
@@ -1578,6 +1545,7 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
     def shutdown(self):
         self.pre_shutdown()
         if self.rpc_client is not None:
+            self._kv_events_fetcher.close()
             self.rpc_client.close()
             self.rpc_client = None
         self._worker_process_monitor.close()
