@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import concurrent.futures
 import os
@@ -112,6 +126,8 @@ class RPCClient:
                                           socket_type=socket_type,
                                           name="rpc_client")
         self._pending_futures = {}
+        self._active_calls: set[asyncio.Task] = set()
+        self._calls_lock = threading.Lock()
         # map request_id to the queue for streaming responses
         self._streaming_queues: Dict[str, AsyncQueue] = {}
         self._streaming_queues_lock = threading.RLock(
@@ -157,9 +173,11 @@ class RPCClient:
     def close(self):
         """Gracefully close the client, cleaning up background tasks."""
 
-        if self._closed:
-            return
-        self._closed = True
+        with self._calls_lock:
+            if self._closed:
+                return
+            self._closed = True
+            active_calls = tuple(self._active_calls)
 
         logger_debug("[client] RPC Client closing")
 
@@ -168,45 +186,63 @@ class RPCClient:
         # loop/executor because they may depend on the loop to complete.
         self._broadcast_streaming_error(RPCCancelled("RPC client closed"))
 
-        # 1. Cancel the reader task
-        if self._reader_task and not self._reader_task.done():
-            if self._loop and self._loop.is_running(
-            ) and self._reader_asyncio_task:
-                try:
+        def cancel_call(task: asyncio.Task) -> None:
+            with self._calls_lock:
+                if task in self._active_calls and not task.done():
+                    task.cancel()
 
-                    async def cancel_reader_task():
-                        if self._reader_asyncio_task and not self._reader_asyncio_task.done(
-                        ):
-                            self._reader_asyncio_task.cancel()
-                            try:
-                                await self._reader_asyncio_task
-                            except asyncio.CancelledError:
-                                pass
+        for task in active_calls:
+            target_loop = task.get_loop()
+            try:
+                target_loop.call_soon_threadsafe(cancel_call, task)
+            except RuntimeError:
+                if not target_loop.is_closed():
+                    raise
+                logger_debug("[client] RPC caller event loop already closed")
 
-                    cancel_future = asyncio.run_coroutine_threadsafe(
-                        cancel_reader_task(), self._loop)
-                    cancel_future.result(timeout=2.0)
-                    logger_debug("[client] Reader task cancelled successfully")
-                except concurrent.futures.TimeoutError:
-                    logger.warning("Reader task did not exit gracefully")
-                except Exception as e:
-                    logger_debug(f"[client] Reader task cleanup: {e}")
+        # Finish active calls before cancelling the response reader.
+        if self._loop and self._loop.is_running():
+            try:
 
-        # 2. Stop the event loop
+                async def cancel_reader_task():
+                    calls = [
+                        task for task in active_calls
+                        if task.get_loop() is self._loop
+                    ]
+                    if calls:
+                        await asyncio.gather(*calls, return_exceptions=True)
+                    if self._reader_asyncio_task and not self._reader_asyncio_task.done(
+                    ):
+                        self._reader_asyncio_task.cancel()
+                        try:
+                            await self._reader_asyncio_task
+                        except asyncio.CancelledError:
+                            pass
+
+                cancel_future = asyncio.run_coroutine_threadsafe(
+                    cancel_reader_task(), self._loop)
+                cancel_future.result(timeout=2.0)
+                logger_debug("[client] Reader task cancelled successfully")
+            except concurrent.futures.TimeoutError:
+                logger.warning("Reader task did not exit gracefully")
+            except Exception as e:
+                logger_debug(f"[client] Reader task cleanup: {e}")
+
+        # Queued future calls must observe closure while their loop can still run.
+        if self._executor:
+            self._executor.shutdown(wait=True)
+
+        # Stop the event loop.
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
 
-        # 3. Join the event loop thread
+        # Join the event loop thread.
         if self._loop_thread:
             self._loop_thread.join(timeout=2.0)
             if self._loop_thread.is_alive():
                 logger.warning("Event loop thread did not exit gracefully")
 
-        # 4. Shutdown the executor
-        if self._executor:
-            self._executor.shutdown(wait=True)
-
-        # 5. Close the socket
+        # Close the socket.
         if self._client_socket:
             self._client_socket.close()
 
@@ -440,6 +476,22 @@ class RPCClient:
             raise
 
     async def _call_async(self, method_name, *args, **kwargs):
+        task = asyncio.current_task()
+        with self._calls_lock:
+            if self._closed:
+                raise RPCCancelled("RPC client closed")
+            self._active_calls.add(task)
+        try:
+            return await self._call_async_impl(method_name, *args, **kwargs)
+        except asyncio.CancelledError:
+            if self._closed:
+                raise RPCCancelled("RPC client closed") from None
+            raise
+        finally:
+            with self._calls_lock:
+                self._active_calls.discard(task)
+
+    async def _call_async_impl(self, method_name, *args, **kwargs):
         """Async version of RPC call.
         Args:
             method_name: Method name to call
@@ -532,8 +584,11 @@ class RPCClient:
         nvtx_mark_debug(f"RPC.sync.{method_name}",
                         color="green",
                         category="RPC")
-        future = asyncio.run_coroutine_threadsafe(
-            self._call_async(method_name, *args, **kwargs), self._loop)
+        with self._calls_lock:
+            if self._closed:
+                raise RPCCancelled("RPC client closed")
+            future = asyncio.run_coroutine_threadsafe(
+                self._call_async(method_name, *args, **kwargs), self._loop)
         result = future.result()
         return result
 
@@ -557,7 +612,10 @@ class RPCClient:
                 self._call_async(name, *args, **kwargs), self._loop)
             return future.result()
 
-        return self._executor.submit(_async_to_sync)
+        with self._calls_lock:
+            if self._closed:
+                raise RPCCancelled("RPC client closed")
+            return self._executor.submit(_async_to_sync)
 
     async def _call_streaming(self, name: str, *args,
                               **kwargs) -> AsyncIterator[Any]:
