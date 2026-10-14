@@ -1631,8 +1631,16 @@ class KVCacheManagerV2(BaseResourceManager):
                 "KV cache manager v2 host tier disabled: a KV connector is attached "
                 "and registers GPU page addresses that tier migration would invalidate."
             )
-        elif kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size >= 0:
+        elif (
+            kv_cache_config.host_cache_size is not None
+            and kv_cache_config.host_cache_size >= 0
+            and (not is_estimating_kv_cache or kv_cache_config.host_cache_size == 0)
+        ):
             host_quota = kv_cache_config.host_cache_size
+            if is_estimating_kv_cache:
+                # A rank-local budget split may produce zero on only some
+                # ranks. They must still join the positive shares' reduction.
+                host_quota = _sync_host_tier_quota(host_quota, mapping)
         else:
             # The V2 MAX_UTILIZATION scheduler relies on suspend/resume to
             # evict and later restore KV cache pages. Without a secondary
@@ -1668,6 +1676,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 memlock_limit,
                 shares_device_memory=is_device_integrated(),
             )
+            if (
+                is_estimating_kv_cache
+                and kv_cache_config.host_cache_size is not None
+                and kv_cache_config.host_cache_size >= 0
+            ):
+                # A probe obeys both the automatic safety limits and the
+                # configured offload budget, before ranks agree on a quota.
+                host_quota = min(host_quota, kv_cache_config.host_cache_size)
             logger.info(
                 f"KV cache manager v2 auto host tier sizing: "
                 f"{local_ranks} co-located rank(s) on this node, "

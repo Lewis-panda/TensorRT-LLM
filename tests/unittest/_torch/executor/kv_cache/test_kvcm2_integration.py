@@ -15,6 +15,7 @@
 
 import array
 import os
+import resource
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -358,6 +359,7 @@ def _make_manager_for_cache_tier_test(
     joint_reuse: bool = False,
     mapping: Mapping | None = None,
     vocab_size: int | None = 16,
+    is_estimating_kv_cache: bool = False,
 ) -> tuple[KVCacheManagerV2, Mock]:
     impl_constructor = Mock(side_effect=impl_side_effect)
     if mapping is None:
@@ -429,6 +431,7 @@ def _make_manager_for_cache_tier_test(
             vocab_size=vocab_size,
             execution_stream=Mock(),
             cold_page_codec_provider=cold_page_codec_provider,
+            is_estimating_kv_cache=is_estimating_kv_cache,
         )
     return manager, impl_constructor
 
@@ -1082,6 +1085,93 @@ def test_avg_seq_len_must_not_exceed_max_seq_len() -> None:
             KvCacheConfig(avg_seq_len=2048),
             max_seq_len=1024,
         )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("is_estimating", [False, True])
+@pytest.mark.parametrize("host_budget", [None, -1, 0, 4 << 20, 64 << 20])
+@pytest.mark.parametrize(
+    "available,local_ranks,memlock,integrated,auto_quota",
+    [
+        pytest.param(256 << 20, 1, resource.RLIM_INFINITY, False, 16 << 20, id="device"),
+        pytest.param(16 << 20, 1, resource.RLIM_INFINITY, False, 8 << 20, id="available"),
+        pytest.param(16 << 20, 2, resource.RLIM_INFINITY, False, 4 << 20, id="local-ranks"),
+        pytest.param(256 << 20, 1, 10 << 20, False, 8 << 20, id="memlock"),
+        pytest.param(16 << 20, 1, resource.RLIM_INFINITY, True, 0, id="integrated-no-headroom"),
+    ],
+)
+def test_estimation_host_tier_obeys_explicit_and_auto_caps(
+    is_estimating, host_budget, available, local_ranks, memlock, integrated, auto_quota
+) -> None:
+    config = KvCacheConfig(max_gpu_total_bytes=16 << 20, host_cache_size=host_budget)
+    distributed = Mock(local_world_size=local_ranks)
+    with (
+        patch.object(Distributed, "get", return_value=distributed),
+        patch.object(kv_cache_v2_module, "is_device_integrated", return_value=integrated),
+        patch.object(
+            os,
+            "sysconf",
+            side_effect={"SC_PAGE_SIZE": 4096, "SC_AVPHYS_PAGES": available // 4096}.get,
+        ),
+        patch.object(resource, "getrlimit", return_value=(memlock, memlock)),
+        patch.object(
+            kv_cache_v2_module,
+            "_compute_auto_host_tier_quota",
+            wraps=kv_cache_v2_module._compute_auto_host_tier_quota,
+        ) as auto_policy,
+        patch.object(
+            kv_cache_v2_module,
+            "_sync_host_tier_quota",
+            wraps=kv_cache_v2_module._sync_host_tier_quota,
+        ) as sync_quota,
+    ):
+        manager, constructor = _make_manager_for_cache_tier_test(
+            config, [Mock()], is_estimating_kv_cache=is_estimating
+        )
+
+    uses_auto = host_budget is None or host_budget < 0 or (is_estimating and host_budget > 0)
+    if host_budget is None or host_budget < 0:
+        expected = auto_quota
+    elif is_estimating:
+        expected = min(host_budget, auto_quota)
+    else:
+        expected = host_budget
+    tiers = constructor.call_args.args[0].cache_tiers
+    assert tiers[0].quota == 16 << 20
+    host_tiers = [tier for tier in tiers if isinstance(tier, HostCacheTierConfig)]
+    assert [tier.quota for tier in host_tiers] == ([expected] if expected else [])
+    assert manager.is_estimating_kv_cache is is_estimating
+    assert config.host_cache_size == host_budget
+    if uses_auto:
+        auto_policy.assert_called_once()
+    else:
+        auto_policy.assert_not_called()
+    if uses_auto or is_estimating:
+        sync_quota.assert_called_once_with(expected, manager.mapping)
+    else:
+        sync_quota.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("host_budget", [0, 4 << 20])
+def test_estimation_zero_share_participates_in_host_quota_sync(host_budget) -> None:
+    config = KvCacheConfig(max_gpu_total_bytes=16 << 20, host_cache_size=host_budget)
+    with (
+        patch.object(Distributed, "get", return_value=Mock(local_world_size=1)),
+        patch.object(kv_cache_v2_module, "is_device_integrated", return_value=False),
+        patch.object(os, "sysconf", return_value=1 << 20),
+        patch.object(resource, "getrlimit", return_value=(resource.RLIM_INFINITY,) * 2),
+        patch.object(kv_cache_v2_module, "_sync_host_tier_quota", return_value=0) as sync_quota,
+    ):
+        manager, constructor = _make_manager_for_cache_tier_test(
+            config, [Mock()], is_estimating_kv_cache=True
+        )
+
+    # Zero and positive rank-local shares both participate and honor fleet MIN.
+    sync_quota.assert_called_once_with(host_budget, manager.mapping)
+    assert not any(
+        isinstance(tier, HostCacheTierConfig) for tier in constructor.call_args.args[0].cache_tiers
+    )
 
 
 def test_disk_secondary_tier_enables_eviction(tmp_path) -> None:

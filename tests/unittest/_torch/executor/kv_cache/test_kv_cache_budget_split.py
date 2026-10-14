@@ -986,15 +986,36 @@ class TestBuildManagersBudgetGates:
         assert draft_share < total_offload
 
     @pytest.mark.parametrize("budget_attr", OFFLOAD_TIER_BUDGET_ATTRS)
-    def test_estimation_managers_drop_explicit_offload_tiers(self, budget_attr, tmp_path):
-        """An explicit offload tier would reserve capacity a probe cannot fill."""
+    @pytest.mark.parametrize("is_v2", [False, True])
+    def test_estimation_splits_host_cap_before_resolving_managers(
+        self, budget_attr, is_v2, tmp_path
+    ):
         c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
+        c._is_kv_cache_manager_v2 = is_v2
 
         c.build_managers({}, estimating_kv_cache=True)
 
         target_config, draft_config = self._configs_passed_to_managers(c)
-        assert getattr(target_config, budget_attr) is None
-        assert getattr(draft_config, budget_attr) is None
+        if budget_attr == "host_cache_size":
+            assert target_config.host_cache_size + draft_config.host_cache_size == 20 * GB
+            assert 0 < draft_config.host_cache_size < 20 * GB
+        else:
+            assert getattr(target_config, budget_attr) is None
+            assert getattr(draft_config, budget_attr) is None
+        assert getattr(c._kv_cache_config, budget_attr) == 20 * GB
+
+    @pytest.mark.parametrize("host_budget", [None, -1, 0])
+    def test_estimation_preserves_unset_and_disabled_host_tier(self, host_budget, tmp_path):
+        c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
+        c._kv_cache_config.host_cache_size = host_budget
+
+        c.build_managers({}, estimating_kv_cache=True)
+
+        target_config, draft_config = self._configs_passed_to_managers(c)
+        assert target_config.host_cache_size == host_budget
+        assert draft_config.host_cache_size == host_budget
+        assert target_config.disk_cache_size is None
+        assert draft_config.disk_cache_size is None
 
     def test_gpu_budget_split_stays_skipped_during_estimation(self, tmp_path):
         """Estimation sizes GPU pools from max_tokens, so it keeps the budget whole."""
@@ -1034,6 +1055,42 @@ class TestBuildManagersBudgetGates:
         draft_share = getattr(draft_config, budget_attr)
         assert target_share + draft_share == total_offload
         assert 0 < draft_share < total_offload
+
+    def test_two_model_estimation_splits_host_cap_and_drops_disk(self, tmp_path):
+        c = self._make_two_model_creator(20 * GB, str(tmp_path))
+
+        c.build_managers({}, estimating_kv_cache=True)
+
+        calls = c._create_kv_cache_manager.call_args_list
+        assert len(calls) == 2
+        configs = [call.kwargs["kv_cache_config_override"] for call in calls]
+        assert sum(config.host_cache_size for config in configs) == 20 * GB
+        assert all(0 < config.host_cache_size < 20 * GB for config in configs)
+        assert all(config.disk_cache_size is None for config in configs)
+        assert c._kv_cache_config.host_cache_size == 20 * GB
+
+    @pytest.mark.parametrize("two_model", [False, True])
+    def test_estimation_missing_costs_do_not_duplicate_host_cap(self, two_model, tmp_path):
+        if two_model:
+            c = self._make_two_model_creator(20 * GB, str(tmp_path))
+        else:
+            c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
+        c._get_target_and_draft_cache_costs = Mock(return_value=None)
+
+        c.build_managers({}, estimating_kv_cache=True)
+
+        if two_model:
+            configs = [
+                call.kwargs["kv_cache_config_override"]
+                for call in c._create_kv_cache_manager.call_args_list
+            ]
+        else:
+            configs = self._configs_passed_to_managers(c)
+        assert [config.host_cache_size for config in configs] == [20 * GB, 0]
+        assert all(config.disk_cache_size is None for config in configs)
+        assert all(config.max_gpu_total_bytes == 10 * GB for config in configs)
+        assert c._kv_cache_config.host_cache_size == 20 * GB
+        assert c._kv_cache_config.disk_cache_size == 20 * GB
 
     def test_two_model_keeps_the_gpu_budget_whole(self, tmp_path):
         """Each two-model manager sizes its GPU pools from the full budget."""

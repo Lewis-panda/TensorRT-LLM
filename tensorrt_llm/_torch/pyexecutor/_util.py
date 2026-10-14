@@ -2775,14 +2775,15 @@ class KvCacheCreator:
 
     @classmethod
     def _drop_explicit_offload_tier_budgets(
-            cls, kv_cache_config: Optional[KvCacheConfig]
-    ) -> Optional[KvCacheConfig]:
-        """Return a copy of the config with explicit offload budgets unset.
+            cls,
+            kv_cache_config: Optional[KvCacheConfig],
+            *,
+            preserve_host_budget: bool = False) -> Optional[KvCacheConfig]:
+        """Return a copy with offload budgets not needed by a probe unset.
 
-        Host sizing then falls to the V2 auto host tier policy, which matches
-        the tier to the manager's own device quota; V1 builds no secondary pool.
-        The disk tier is V2 only and has no auto policy, so dropping its budget
-        leaves the tier out.
+        Retain the host budget until the manager class is resolved: V2 uses
+        it as an upper bound on its auto tier, while V1 must drop it to avoid
+        building a secondary pool. The disk budget is always dropped.
         """
         if kv_cache_config is None:
             return kv_cache_config
@@ -2790,6 +2791,7 @@ class KvCacheCreator:
             attr: None
             for attr in cls._OFFLOAD_TIER_BUDGET_ATTRS
             if getattr(kv_cache_config, attr)
+            and not (preserve_host_budget and attr == "host_cache_size")
         }
         if not dropped:
             return kv_cache_config
@@ -2822,15 +2824,15 @@ class KvCacheCreator:
                                       self_kv_cache_config.enable_block_reuse
                                       and self._joint_reuse_supported())
 
-        # Estimation managers are throwaway probes whose pools only hold dummy
-        # requests, so an explicit offload tier would reserve capacity the probe
-        # cannot fill. Encoder-decoder runs skip estimation, so dropping the
-        # cross budgets is defensive.
+        # Keep host caps through the target/draft split. The shared factory
+        # drops them for resolved V1 managers; V2 caps its auto-sized tier.
+        # Probes only hold dummy requests and need no disk allocation.
+        # Encoder-decoder runs skip estimation, so the cross case is defensive.
         if estimating_kv_cache:
             self_kv_cache_config = self._drop_explicit_offload_tier_budgets(
-                self_kv_cache_config)
+                self_kv_cache_config, preserve_host_budget=True)
             cross_kv_cache_config = self._drop_explicit_offload_tier_budgets(
-                cross_kv_cache_config)
+                cross_kv_cache_config, preserve_host_budget=True)
 
         # Split combined KV cache budgets before creating managers.
         has_draft = (
@@ -2854,6 +2856,12 @@ class KvCacheCreator:
                     self._split_kv_cache_budget_for_draft(
                         budget_attr, self_kv_cache_config,
                         draft_kv_cache_config))
+            if (estimating_kv_cache and draft_kv_cache_config is None
+                    and (self_kv_cache_config.host_cache_size or 0) > 0):
+                # Unknown cache costs leave the cap on the target. A draft
+                # probe must not inherit and reserve that same cap again.
+                draft_kv_cache_config = self_kv_cache_config.model_copy(
+                    update={"host_cache_size": 0})
 
         compression_config = self._llm_args.kv_cache_compression_config
         compression_manager = create_kv_cache_compression_manager(
@@ -3085,6 +3093,13 @@ def _create_kv_cache_manager(
         raise ValueError(
             "Cold-page quantization requires the resolved KV cache manager "
             f"to be KVCacheManagerV2; selected {kv_cache_manager_cls.__name__}")
+
+    if (estimating_kv_cache
+            and not issubclass(kv_cache_manager_cls, KVCacheManagerV2)):
+        # Target and draft managers can resolve to different versions. V1
+        # allocates an explicit host tier in full even during estimation.
+        kv_cache_config = KvCacheCreator._drop_explicit_offload_tier_budgets(
+            kv_cache_config)
 
     if (estimating_kv_cache
             and issubclass(kv_cache_manager_cls, KVCacheManagerV2)

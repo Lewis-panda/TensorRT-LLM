@@ -1550,6 +1550,38 @@ def _mixed_schedule_pretrained(layer_types: list[str], **overrides: object) -> S
     return SimpleNamespace(**fields)
 
 
+@pytest.mark.parametrize("manager_cls", [KVCacheManager, KVCacheManagerV2])
+@pytest.mark.parametrize("estimating", [False, True])
+@pytest.mark.parametrize("host_budget", [None, -1, 0, 1 << 30])
+@pytest.mark.parametrize("is_draft", [False, True])
+def test_estimation_host_cap_follows_resolved_manager(
+    manager_cls, estimating, host_budget, is_draft
+) -> None:
+    pretrained = SimpleNamespace(
+        hidden_size=1024,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        num_hidden_layers=2,
+        vocab_size=32000,
+    )
+    config = KvCacheConfig(max_tokens=1024, host_cache_size=host_budget)
+
+    received = _create_manager_and_capture_config(
+        pretrained,
+        config,
+        max_seq_len=1024,
+        manager_cls=manager_cls,
+        estimating_kv_cache=estimating,
+        is_draft=is_draft,
+    )
+
+    expected = host_budget
+    if estimating and manager_cls is KVCacheManager and host_budget:
+        expected = None
+    assert received.host_cache_size == expected
+    assert config.host_cache_size == host_budget
+
+
 def _eagle3_one_model_spec_config(num_draft_hidden_layers: int | None = None) -> SimpleNamespace:
     """The fields `get_num_spec_layers` and `should_use_separate_draft_kv_cache`
     read from an Eagle3 one-model speculative config."""
