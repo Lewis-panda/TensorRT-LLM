@@ -838,6 +838,7 @@ def create_completion_logprobs(token_ids: List[int],
     token_logprobs = []
     top_logprobs_list = []
     tokens = []
+    offset = initial_offset
     for token_id, logprob in zip(token_ids, logprobs):
         if isinstance(logprob, dict):
             token_logprobs.append(max(logprob[token_id].logprob, -9999.0))
@@ -850,10 +851,8 @@ def create_completion_logprobs(token_ids: List[int],
             token_logprobs.append(max(logprob, -9999.0))
 
         token = tokenizer.decode(token_id)
-        if len(text_offset) == 0:
-            text_offset.append(initial_offset)
-        else:
-            text_offset.append(text_offset[-1] + len(token))
+        text_offset.append(offset)
+        offset += len(token)
         tokens.append(token)
     return CompletionLogProbs(text_offset=text_offset,
                               token_logprobs=token_logprobs,
