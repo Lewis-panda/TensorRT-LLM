@@ -24,6 +24,7 @@ from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
 from .proxy import _check_collective_rpc_guard
 from .result import IterationResult
+from .rpc.iteration_result import _RpcIterationResult
 from .rpc.rpc_common import RPCError
 from .rpc_proxy_mixin import RpcExecutorMixin
 from .rpc_worker import RpcWorker
@@ -149,24 +150,17 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         """
         self._maybe_initialize_iteration_results()
 
-        if self._iter_stats_result is None:
+        if self._iter_stats_result is None or self.rpc_client is None:
             print_colored("Iteration statistics are not available yet.\n",
                           "yellow")
             from .executor import empty_async_iterable
             return empty_async_iterable()
 
-        # Fetch stats via RPC and populate the result
-        try:
-            stats = self.rpc_client.fetch_stats_wait_async(
-                timeout=timeout).remote()
-        except Exception:
-            stats = []
-
-        for stat in stats:
-            self._iter_stats_result.queue.put(stat)
-
-        self._iter_stats_result.set_timeout(timeout)
-        return self._iter_stats_result
+        result = _RpcIterationResult(
+            self.rpc_client.fetch_stats_wait_async(timeout=timeout),
+            self._iter_stats_result)
+        result.set_timeout(timeout)
+        return result
 
     def get_kv_events(self, timeout: float) -> List[dict]:
         """Get iteration KV events from the runtime via RPC.
@@ -198,22 +192,15 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         # Initialize iteration result if needed
         self._maybe_initialize_iteration_results()
 
-        if self._iter_kv_events_result is None:
+        if self._iter_kv_events_result is None or self.rpc_client is None:
             from .executor import empty_async_iterable
             return empty_async_iterable()
 
-        # Fetch kv events via RPC and populate the result
-        try:
-            events = self.rpc_client.fetch_kv_cache_events_wait_async(
-                timeout=timeout).remote()
-        except Exception:
-            events = []
-
-        for event in events:
-            self._iter_kv_events_result.queue.put(event)
-
-        self._iter_kv_events_result.set_timeout(timeout)
-        return self._iter_kv_events_result
+        result = _RpcIterationResult(
+            self.rpc_client.fetch_kv_cache_events_wait_async(timeout=timeout),
+            self._iter_kv_events_result)
+        result.set_timeout(timeout)
+        return result
 
     def collective_rpc(
         self,
